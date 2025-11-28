@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import joblib, pymongo, bcrypt, jwt, datetime
+import joblib, pymongo, bcrypt, jwt, datetime, re
 from config import MONGO_URI, JWT_SECRET, JWT_ALGO
 
 # Google Auth
@@ -102,7 +102,6 @@ def predict():
 
 
 # Google Login
-# Google Login
 @app.route("/google-login", methods=["POST"])
 def google_login():
     token_id = request.json.get("tokenId")
@@ -150,27 +149,133 @@ normal_sample = [-1.3598071336738, -0.0727811733098497,
 
 @app.route("/chatbot", methods=["POST"])
 def chatbot():
-    user_msg = request.json.get("message", "").lower()
-    reply = "Sorry, I didn’t understand 🤔"
+    """
+    Upgraded chatbot endpoint.
+    - Better intent matching (regex + keywords)
+    - Optional personalized greetings if valid JWT present in Authorization header
+    - Returns structured JSON: {"reply": str, "type": "text|sample|prediction", "data": {...}}
+    - Safely calls `model.predict` and `model.predict_proba` for sample predictions (uses existing model)
+    """
+    raw_msg = request.json.get("message", "")
+    user_msg = (raw_msg or "").strip().lower()
 
-    if "hello" in user_msg or "hi" in user_msg:
-        reply = "Hello 👋 I'm Help AI. Ask me about fraud detection app."
-    elif "fraud" in user_msg and "sample" in user_msg:
-        reply = f"Here is a fraud transaction sample:\n{fraud_sample}"
-    elif "normal" in user_msg and "sample" in user_msg:
-        reply = f"Here is a normal transaction sample:\n{normal_sample}"
-    elif "predict" in user_msg:
-        reply = "👉 Go to Predict page or ask me for a fraud/normal sample."
-    elif "dataset" in user_msg:
-        reply = "📊 We used the Kaggle credit card fraud dataset (284,807 transactions, 492 frauds)."
-    elif "metrics" in user_msg or "accuracy" in user_msg:
-        reply = "Our model (RandomForest + SMOTE) evaluates with Precision, Recall, F1, and AUC."
-    elif "login" in user_msg:
-        reply = "🔑 You can login with Email/Password or Google Sign-In."
-    elif "contact" in user_msg or "support" in user_msg:
-        reply = "📧 Reach us at support@frauddemo.com"
+    # Try to get user email from token (if provided) for personalization
+    auth_header = request.headers.get("Authorization", "")
+    user_email = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        token_data = verify_token(token)
+        if token_data:
+            user_email = token_data.get("email")
 
-    return jsonify({"reply": reply})
+    # helpers
+    def text_response(text):
+        return jsonify({"reply": text, "type": "text", "data": None})
+
+    def sample_response(name, arr):
+        return jsonify({
+            "reply": f"Here is a {name} transaction sample (length {len(arr)}).",
+            "type": "sample",
+            "data": {"sample_name": name, "sample": arr}
+        })
+
+    def prediction_response(pred, proba):
+        return jsonify({
+            "reply": f"Prediction: {int(pred)} (fraud probability {proba:.4f})",
+            "type": "prediction",
+            "data": {"prediction": int(pred), "fraud_probability": float(proba)}
+        })
+
+    # default reply
+    default = "Sorry, I didn’t understand 🤔 Try: 'hello', 'help', 'show fraud sample', 'show normal sample', 'predict fraud sample', 'dataset', or 'metrics'."
+
+    # quick empty check
+    if not user_msg:
+        return text_response("Please send a message for the chatbot to respond to.")
+
+    # greeting
+    if re.search(r"\b(hi|hello|hey|yo|hiya)\b", user_msg):
+        name_part = f" {user_email}" if user_email else ""
+        return text_response(f"Hello{name_part} 👋 I'm Help AI. Ask me about the fraud detection app or type 'help' for commands.")
+
+    # help
+    if "help" in user_msg or "commands" in user_msg:
+        help_text = (
+            "I can help with:\n"
+            "- 'show fraud sample' or 'fraud sample' -> returns an example fraud transaction.\n"
+            "- 'show normal sample' or 'normal sample' -> returns an example normal transaction.\n"
+            "- 'predict fraud sample' or 'predict normal sample' -> run model on the sample and return prediction + probability.\n"
+            "- 'dataset' -> info about the dataset used.\n"
+            "- 'metrics' or 'accuracy' -> model evaluation summary.\n"
+            "- 'login' -> how to login.\n"
+            "- 'contact' or 'support' -> support contact info."
+        )
+        return text_response(help_text)
+
+    # dataset info
+    if re.search(r"\bdataset\b", user_msg):
+        return text_response("📊 We used the Kaggle credit card fraud dataset (284,807 transactions, 492 frauds).")
+
+    # metrics / model info
+    if re.search(r"\b(metrics|accuracy|precision|recall|f1|auc)\b", user_msg):
+        return text_response("Our model (RandomForest + SMOTE) is evaluated using Precision, Recall, F1-score and AUC. Ask for 'metrics' to get more details from logs if available.")
+
+    # login info
+    if re.search(r"\b(login|sign in|signin|sign-in)\b", user_msg):
+        return text_response("🔑 You can login using Email/Password at /login or use Google Sign-In at /google-login.")
+
+    # contact/support
+    if re.search(r"\b(contact|support|helpdesk|email)\b", user_msg):
+        return text_response("📧 Reach us at support@frauddemo.com")
+
+    # show samples: support variations like 'show fraud sample', 'fraud sample', 'get fraud sample 1' or 'show 1 fraud sample'
+    if re.search(r"\bfraud\b.*\bsample\b", user_msg) or re.search(r"\bsample\b.*\bfraud\b", user_msg):
+        return sample_response("fraud", fraud_sample)
+
+    if re.search(r"\bnormal\b.*\bsample\b", user_msg) or re.search(r"\bsample\b.*\bnormal\b", user_msg):
+        return sample_response("normal", normal_sample)
+
+    # prediction on sample: "predict fraud sample" or "predict normal sample"
+    if re.search(r"\bpredict\b.*\bfraud\b.*\bsample\b", user_msg) or re.search(r"\bpredict\b.*\bsample\b.*\bfraud\b", user_msg):
+        try:
+            if hasattr(model, "predict"):
+                features = fraud_sample
+                pred = model.predict([features])
+                proba = None
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba([features])[0][1]
+                else:
+                    proba = float(pred[0])
+                return prediction_response(pred[0], proba)
+            else:
+                return text_response("Model not available for predictions on the server.")
+        except Exception as e:
+            print("Prediction error (fraud sample):", e)
+            return text_response(f"Prediction failed: {str(e)}")
+
+    if re.search(r"\bpredict\b.*\bnormal\b.*\bsample\b", user_msg) or re.search(r"\bpredict\b.*\bsample\b.*\bnormal\b", user_msg):
+        try:
+            if hasattr(model, "predict"):
+                features = normal_sample
+                pred = model.predict([features])
+                proba = None
+                if hasattr(model, "predict_proba"):
+                    proba = model.predict_proba([features])[0][1]
+                else:
+                    proba = float(pred[0])
+                return prediction_response(pred[0], proba)
+            else:
+                return text_response("Model not available for predictions on the server.")
+        except Exception as e:
+            print("Prediction error (normal sample):", e)
+            return text_response(f"Prediction failed: {str(e)}")
+
+    # small fallback for 'predict' that points to /predict endpoint (safer)
+    if "predict" in user_msg:
+        return text_response("👉 To run predictions with your own features, call POST /predict with Authorization header and JSON {\"features\": [ ... ]}.")
+
+    # final fallback
+    return text_response(default)
 
 
 if __name__ == "__main__":
